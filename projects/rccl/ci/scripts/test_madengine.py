@@ -10,12 +10,13 @@ This script handles:
   6. Appending results to a JSONL datastore for trend analysis
 
 Usage from GitHub Actions (on ruby-linux-slurm-scale-runner):
-  python projects/rccl/ci/scripts/test_madengine.py \
-      --artifact-dir /apps/cvs_tests/dist_new/dist/rocm \
+  python3 rocm-systems/projects/rccl/ci/scripts/test_madengine.py \
+      --artifact-dir ./build \
       --workload llama-3.1-70b-training \
       --cluster ruby \
       --nodes 2 \
-      --results-dir /apps/rccl-ci/perf
+      --results-dir /apps/rccl-ci/madengine/perf \
+      --work-dir /apps/rccl-ci/madengine/workdir/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
 """
 from __future__ import annotations
 
@@ -133,7 +134,7 @@ CLUSTER_CONFIGS = {
             "NCCL_SOCKET_IFNAME": "fenic0",
             "NCCL_DEBUG": "WARN",
         },
-        "results_base": "/apps/rccl-ci/perf",
+        "results_base": "/apps/rccl-ci/madengine/perf",
     },
 }
 
@@ -276,67 +277,82 @@ def patch_madengine_for_cluster(
     template = src / "deployment" / "templates" / "slurm" / "job.sh.j2"
     if template and template.exists():
         content = template.read_text()
-        # Patch the MULTI-NODE verification block (inside TASK_SCRIPT_EOF
-        # heredoc) to install madengine per-node when the head node's venv
-        # is incompatible (Python 3.10 vs 3.9). The single-node block
-        # runs on the head node where the venv works — leave it alone.
-        #
-        # Find the multi-node block by searching for the verification
-        # string AFTER the TASK_SCRIPT_EOF heredoc marker.
-        heredoc_marker = "TASK_SCRIPT_EOF"
-        heredoc_idx = content.find(heredoc_marker)
-        if heredoc_idx != -1:
-            verify_str = 'echo "Verifying madengine availability..."'
-            mn_verify_idx = content.find(verify_str, heredoc_idx)
-            if mn_verify_idx == -1:
-                mn_verify_idx = content.find(verify_str)
-            if mn_verify_idx != -1:
-                mn_end_str = "# Create local execution manifest"
-                mn_end_idx = content.find(mn_end_str, mn_verify_idx)
-                if mn_end_idx != -1:
-                    replacement = (
-                        'echo "Verifying madengine availability..."\n'
-                        'MAD_CLI_COMMAND=""\n'
-                        'if command -v madengine >/dev/null 2>&1 && '
-                        'madengine --help >/dev/null 2>&1; then\n'
-                        '    MAD_CLI_COMMAND="madengine"\n'
-                        '    echo "  ✓ madengine available: '
-                        '$(madengine --version 2>&1 | head -1)"\n'
-                        'fi\n'
-                        'if [ -z "$MAD_CLI_COMMAND" ]; then\n'
-                        '    echo "  ⚠ madengine not functional — '
-                        'installing for this node\'s Python ($(python3 --version))"\n'
-                        '    SUBMISSION_DIR={{ manifest_file | dirname }}\n'
-                        '    MADENGINE_SRC="$SUBMISSION_DIR/madengine"\n'
-                        '    if [ -d "$MADENGINE_SRC" ] && [ -f "$MADENGINE_SRC/pyproject.toml" ]; then\n'
-                        '        python3 -m venv "$WORKSPACE/node_venv"\n'
-                        '        source "$WORKSPACE/node_venv/bin/activate"\n'
-                        '        pip install --upgrade pip setuptools wheel 2>&1 | tail -3\n'
-                        '        pip install "$MADENGINE_SRC" 2>&1 | tail -20\n'
-                        '        if madengine --version >/dev/null 2>&1; then\n'
-                        '            MAD_CLI_COMMAND="madengine"\n'
-                        '            echo "  ✓ madengine installed: '
-                        '$(madengine --version 2>&1 | head -1)"\n'
-                        '        else\n'
-                        '            echo "  ✗ madengine install failed"\n'
-                        '            exit 1\n'
-                        '        fi\n'
-                        '    else\n'
-                        '        echo "  ✗ madengine source not found at $MADENGINE_SRC"\n'
-                        '        exit 1\n'
-                        '    fi\n'
-                        'fi\n'
-                        'echo ""\n\n'
-                    )
-                    content = content[:mn_verify_idx] + replacement + content[mn_end_idx:]
-                    template.write_text(content)
-                    log.info("Patched SLURM template: added per-node madengine install (multi-node)")
-                else:
-                    log.warning("Could not find end of multi-node verification block")
-            else:
-                log.warning("Could not find multi-node verification block in template")
-        else:
-            log.warning("TASK_SCRIPT_EOF not found — template may not have multi-node support")
+        # The whole template is the sbatch script, so both verification blocks
+        # run on a compute node, and both inherit the submission environment
+        # whose PATH leads with the head node's venv. That interpreter belongs
+        # to another distro (3.10/3.12 there against 3.9 here), so madengine is
+        # not usable from it and both blocks need the node-local bootstrap.
+        verify_str = 'echo "Verifying madengine availability..."'
+        heredoc_idx = content.find("TASK_SCRIPT_EOF")
+        blocks = [
+            ("single-node", 0, "# Single-node: Create local execution manifest"),
+            ("multi-node", heredoc_idx, "# Create local execution manifest"),
+        ]
+        # Right to left, so patching one does not move the other's offsets.
+        for label, search_from, end_str in sorted(
+            blocks, key=lambda b: b[1], reverse=True
+        ):
+            if search_from < 0:
+                log.warning("Could not locate the %s verification block", label)
+                continue
+            verify_idx = content.find(verify_str, search_from)
+            end_idx = content.find(end_str, verify_idx) if verify_idx != -1 else -1
+            if verify_idx == -1 or end_idx == -1:
+                log.warning("Could not locate the %s verification block", label)
+                continue
+            replacement = (
+                'echo "Verifying madengine availability..."\n'
+                'MAD_CLI_COMMAND=""\n'
+                'if command -v madengine >/dev/null 2>&1 && '
+                'madengine --help >/dev/null 2>&1; then\n'
+                '    MAD_CLI_COMMAND="madengine"\n'
+                '    echo "  ✓ madengine available: '
+                '$(madengine --version 2>&1 | head -1)"\n'
+                'fi\n'
+                'if [ -z "$MAD_CLI_COMMAND" ]; then\n'
+                # SLURM exports the submitting environment, so PATH still
+                # leads with the head node's venv. Its interpreter belongs
+                # to another distro and does not run here, which is why
+                # madengine was not functional in the first place. Find an
+                # interpreter that actually belongs to this node.
+                '    NODE_PYTHON=""\n'
+                '    for cand in /usr/bin/python3 /usr/local/bin/python3; do\n'
+                '        if [ -x "$cand" ] && "$cand" -c "import venv" >/dev/null 2>&1; then\n'
+                '            NODE_PYTHON="$cand"; break\n'
+                '        fi\n'
+                '    done\n'
+                '    if [ -z "$NODE_PYTHON" ]; then\n'
+                '        echo "  ✗ no usable python3 on $(hostname)"\n'
+                '        exit 1\n'
+                '    fi\n'
+                '    echo "  ⚠ madengine not functional — '
+                'installing for this node\'s Python '
+                '($("$NODE_PYTHON" --version 2>&1) at $NODE_PYTHON)"\n'
+                '    SUBMISSION_DIR={{ manifest_file | dirname }}\n'
+                '    MADENGINE_SRC="$SUBMISSION_DIR/madengine"\n'
+                '    if [ -d "$MADENGINE_SRC" ] && [ -f "$MADENGINE_SRC/pyproject.toml" ]; then\n'
+                '        "$NODE_PYTHON" -m venv "$WORKSPACE/node_venv"\n'
+                '        source "$WORKSPACE/node_venv/bin/activate"\n'
+                '        pip install --upgrade pip setuptools wheel 2>&1 | tail -3\n'
+                '        pip install "$MADENGINE_SRC" 2>&1 | tail -20\n'
+                '        if madengine --version >/dev/null 2>&1; then\n'
+                '            MAD_CLI_COMMAND="madengine"\n'
+                '            echo "  ✓ madengine installed: '
+                '$(madengine --version 2>&1 | head -1)"\n'
+                '        else\n'
+                '            echo "  ✗ madengine install failed"\n'
+                '            exit 1\n'
+                '        fi\n'
+                '    else\n'
+                '        echo "  ✗ madengine source not found at $MADENGINE_SRC"\n'
+                '        exit 1\n'
+                '    fi\n'
+                'fi\n'
+                'echo ""\n\n'
+            )
+            content = content[:verify_idx] + replacement + content[end_idx:]
+            log.info("Patched SLURM template: per-node madengine install (%s)", label)
+        template.write_text(content)
 
     template = src / "deployment" / "templates" / "slurm" / "job.sh.j2"
     if template and template.exists():
