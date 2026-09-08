@@ -81,6 +81,7 @@ RJ_DIAGNOSTIC_POP
 #include <iterator>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -168,7 +169,15 @@ class TestMemoryInstruction : public Instruction {
 public:
   explicit TestMemoryInstruction(std::unique_ptr<DynamicInstState> state)
       : Instruction("test_mem", nullptr) {
-    flags_ |= MEMORY_OP;
+    if (state->tag() == SCALAR_MEM) {
+      const auto &memory = *static_cast<const ScalarMemState *>(state.get());
+      set_memory_issue_info(memory.wait_counter_type, MemoryCompletionClass::UNORDERED, false);
+    } else {
+      const auto &memory = *static_cast<const VectorMemState *>(state.get());
+      const auto completion_class =
+          state->tag() == LOCAL_MEM ? MemoryCompletionClass::LDS : MemoryCompletionClass::VMEM;
+      set_memory_issue_info(memory.wait_counter_type, completion_class);
+    }
     set_data(std::move(state));
   }
 };
@@ -239,6 +248,9 @@ struct HookEvent {
   uint8_t byte_mask = 0;
   uint64_t pc = 0;
   std::thread::id callback_thread;
+  WaitCounterType wait_counter_type = WaitCounterType::VMCNT;
+  MemoryCompletionClass completion_class = MemoryCompletionClass::UNCLASSIFIED;
+  std::optional<WaitCounterType> alternate_wait_counter_type;
   std::string mnemonic;
   std::string kernel_name;
   std::string kernel_symbol;
@@ -316,6 +328,11 @@ public:
     e.wf_id = wf.wf_id();
     e.pc = pc;
     e.mnemonic = inst.mnemonic();
+    if (const auto *info = inst.amdgpu_memory_issue_info()) {
+      e.wait_counter_type = info->wait_counter_type;
+      e.completion_class = info->completion_class;
+      e.alternate_wait_counter_type = info->alternate_wait_counter_type;
+    }
     events.push_back(e);
   }
 
@@ -3809,6 +3826,37 @@ TEST(HookOrderingTest, WorkgroupDispatchedReportsPhysicalRegisterBlockSizes) {
   EXPECT_GT(it->physical_vgpr_count, f.cu()->config().vgprs_per_wf);
   EXPECT_EQ(it->physical_sgpr_count, f.cu()->sgpr_allocation_block_size());
   EXPECT_GT(it->physical_sgpr_count, 32u);
+}
+
+TEST(HookOrderingTest, BeforeInstructionExposesMemoryIssueBeforeOperandReadsAndRouting) {
+  PluginFixture f(/*num_wf_slots=*/1);
+  auto *p = f.attach_ordering_plugin();
+  const auto load =
+      cdna4::build_smem(cdna4::kSLoadDwordSmem, {.sbase = 0, .sdata = 4, .imm = 1, .offset = 0});
+  const std::array<uint32_t, 3> code = {load[0], load[1], S_ENDPGM};
+  f.run_kernel(code.data(), code.size());
+  f.shutdown();
+
+  const auto before_instruction =
+      std::find_if(p->events.begin(), p->events.end(), [](const HookEvent &e) {
+        return e.kind == HookEvent::BEFORE_INSTRUCTION && e.mnemonic == "s_load_dword";
+      });
+  ASSERT_NE(before_instruction, p->events.end());
+  EXPECT_EQ(before_instruction->wait_counter_type, WaitCounterType::LGKMCNT);
+  EXPECT_EQ(before_instruction->completion_class, MemoryCompletionClass::UNORDERED);
+  EXPECT_FALSE(before_instruction->alternate_wait_counter_type);
+
+  const auto first_operand_read =
+      std::find_if(std::next(before_instruction), p->events.end(),
+                   [](const HookEvent &e) { return e.kind == HookEvent::READ_SGPR; });
+  const auto route =
+      std::find_if(std::next(before_instruction), p->events.end(), [](const HookEvent &e) {
+        return e.kind == HookEvent::ROUTE_MEMORY && e.mnemonic == "s_load_dword";
+      });
+  ASSERT_NE(first_operand_read, p->events.end());
+  ASSERT_NE(route, p->events.end());
+  EXPECT_LT(before_instruction, first_operand_read);
+  EXPECT_LT(first_operand_read, route);
 }
 
 // The immediate-halt branch frees a wave's registers the instant s_endpgm
