@@ -50,7 +50,7 @@
 #if defined(__linux__)
 #include <link.h>
 #include <dlfcn.h>
-#include <amdgpu_drm.h>
+#include <hsakmt/drm/amdgpu_drm.h>
 #include <sys/mman.h>
 #endif
 
