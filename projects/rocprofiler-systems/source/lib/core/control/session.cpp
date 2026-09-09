@@ -19,7 +19,7 @@ namespace rocprofsys::control
 void
 session::shutdown()
 {
-    const auto _thread_state_guard = state::thread::scoped(state::thread::Internal);
+    const auto thread_state_guard = state::thread::scoped(state::thread::Internal);
     {
         const std::scoped_lock subs_lk{ m_subscribers_mutex };
         m_subscribers.clear();
@@ -34,13 +34,13 @@ session::shutdown()
 void
 session::subscribe(subscriber sub)
 {
-    const auto _thread_state_guard = state::thread::scoped(state::thread::Internal);
+    const auto thread_state_guard = state::thread::scoped(state::thread::Internal);
     const std::scoped_lock subs_lk{ m_subscribers_mutex };
     m_subscribers.push_back(std::move(sub));
 }
 
 void
-session::register_trigger(std::string_view name, action initial)
+session::register_trigger(std::string_view name, Action initial)
 {
     apply_locked_transition([&] { m_actions[std::string{ name }] = initial; }, name);
 }
@@ -52,7 +52,7 @@ session::unregister_trigger(std::string_view name)
 }
 
 void
-session::set_action(std::string_view name, action act)
+session::set_action(std::string_view name, Action act)
 {
     apply_locked_transition([&] { m_actions[std::string{ name }] = act; }, name);
 }
@@ -61,7 +61,7 @@ void
 session::apply_locked_transition(const std::function<void()>& mutate,
                                  std::string_view             name)
 {
-    const auto _thread_state_guard = state::thread::scoped(state::thread::Internal);
+    const auto thread_state_guard = state::thread::scoped(state::thread::Internal);
     const std::scoped_lock notify_lk{ m_notify_mutex };
 
     bool was_active = false;
@@ -99,13 +99,13 @@ bool
 session::resolve_locked() const noexcept
 {
     return std::ranges::none_of(
-        m_actions, [](const auto& entry) { return entry.second == action::pause; });
+        m_actions, [](const auto& entry) { return entry.second == Action::Pause; });
 }
 
 void
 session::notify_pause()
 {
-    const auto _thread_state_guard = state::thread::scoped(state::thread::Internal);
+    const auto thread_state_guard = state::thread::scoped(state::thread::Internal);
     const std::scoped_lock notify_lk{ m_subscribers_mutex };
     for(const auto& sub : m_subscribers)
     {
@@ -120,7 +120,7 @@ session::notify_pause()
 void
 session::notify_resume()
 {
-    const auto _thread_state_guard = state::thread::scoped(state::thread::Internal);
+    const auto thread_state_guard = state::thread::scoped(state::thread::Internal);
     const std::scoped_lock notify_lk{ m_subscribers_mutex };
     for(const auto& sub : m_subscribers)
     {

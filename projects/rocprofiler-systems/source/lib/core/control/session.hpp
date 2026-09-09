@@ -15,11 +15,11 @@ namespace rocprofsys::control
 {
 /// What a single trigger currently wants. `skip` and `trace` both mean "not
 /// asking for a pause"; only `pause` affects resolution.
-enum class action
+enum class Action
 {
-    skip,
-    trace,
-    pause
+    Skip,
+    Trace,
+    Pause
 };
 
 struct subscriber
@@ -47,11 +47,11 @@ public:
     /// Seed a trigger's action. @p name identifies the trigger for the
     /// lifetime of its registration. Broadcasts to subscribers if this
     /// registration changes the session's active/paused state.
-    void register_trigger(std::string_view name, action initial);
+    void register_trigger(std::string_view name, Action initial);
 
     void unregister_trigger(std::string_view name);
 
-    void set_action(std::string_view name, action act);
+    void set_action(std::string_view name, Action act);
 
     [[nodiscard]] bool is_active() const noexcept
     {
@@ -59,7 +59,7 @@ public:
     }
 
 private:
-    std::unordered_map<std::string, action> m_actions;
+    std::unordered_map<std::string, Action> m_actions;
     std::vector<subscriber>                 m_subscribers;
     std::atomic<bool>                       m_active{ true };
 
